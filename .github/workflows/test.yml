@@ -37,11 +37,7 @@ jobs:
           done
 
       - name: unit tests
-        run: |
-          node --test \
-            core.test.mjs \
-            server.test.mjs \
-            recommend.test.mjs \
-            repo-tree.test.mjs \
-            pipeline.test.mjs \
-            index.test.mjs
+        run: node --test *.test.mjs
+
+      - name: recommend baseline (offline fixture)
+        run: node eval-recommend.mjs --fixture --check
