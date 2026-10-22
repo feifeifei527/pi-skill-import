@@ -31,6 +31,16 @@ const GENERIC_FACTOR = 0.2;
 /** 词出现在超过这个比例的文档里，也按通用词处理（自动发现未来变烂大街的词） */
 const COMMON_DF_RATIO = 0.3;
 
+/**
+ * 两字母技术缩写：`RL / KL / IK` 这类词在中文句子里就是实义词，
+ * 但通用分词规则（英文词 ≥3）会把它们当噪声丢掉，于是「PPO 训练 RL」
+ * 只剩 PPO 一个信号。这里维护白名单，只认独立成词的缩写。
+ */
+const TECH_SHORT = new Set([
+	"rl", "kl", "ik", "ml", "ai", "dl", "cv", "ci", "cd", "ui", "ux", "db", "io", "os", "qa",
+	"js", "ts", "py", "kv", "ar", "vr", "gd", "lr", "ff", "pb", "tf", "pt", "hk", "wp",
+]);
+
 const STOP_ZH = new Set([
 	"这个", "那个", "我们", "你们", "他们", "可以", "需要", "一个", "什么", "怎么", "如何", "现在", "已经", "还是",
 	"然后", "因为", "所以", "但是", "如果", "就是", "没有", "不是", "这样", "那样", "一下", "一些", "这些", "那些",
@@ -50,6 +60,10 @@ function tokenize(text) {
 				if (part.length >= 3 && !STOP_EN.has(part)) out.push(part);
 			}
 		}
+	}
+	// 两字母技术缩写（白名单）：
+	for (const m of s.matchAll(/\b([a-z]{2})\b/g)) {
+		if (TECH_SHORT.has(m[1])) out.push(m[1]);
 	}
 	for (const m of s.matchAll(/[\u4e00-\u9fa5]{2,}/g)) {
 		const seg = m[0];
@@ -234,4 +248,13 @@ function parsePicks(text, candidates) {
 	return out;
 }
 
-module.exports = { tokenize, buildProfile, scoreCatalog, parseRerank, parsePicks, GENERIC_TOKENS, GENERIC_FACTOR };
+module.exports = {
+	tokenize,
+	buildProfile,
+	scoreCatalog,
+	parseRerank,
+	parsePicks,
+	GENERIC_TOKENS,
+	GENERIC_FACTOR,
+	TECH_SHORT,
+};

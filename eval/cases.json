@@ -1,0 +1,149 @@
+{
+	"version": 1,
+	"note": "显式技能名标签的固定回归样例，尚未经过独立人工盲审。expect 是允许的名字，top3 至少命中一个算标签命中；mustNot 只挡住已列出的禁推项，不代表其它候选都适用。expectNone 表示固定库无合适技能。配合 eval/fixture-catalog.json 跑 --fixture；真实索引请用 --list 人工审阅。",
+	"cases": [
+		{
+			"id": "pdf-tables",
+			"q": "把这个 PDF 里的表格抽出来",
+			"expect": ["pdf-tools", "pdf"],
+			"mustNot": ["pptx", "xlsx"]
+		},
+		{
+			"id": "weekly-ppt",
+			"q": "帮我写一份周报 PPT",
+			"expect": ["pptx", "slides"],
+			"mustNot": ["pdf-tools", "xlsx"]
+		},
+		{
+			"id": "ppo-reward-drop",
+			"q": "训练 PPO 的时候 reward 突然掉了，帮我排查",
+			"expect": ["train-debug", "stable-baselines3"],
+			"mustNot": ["pptx", "xlsx"]
+		},
+		{
+			"id": "conventional-commit",
+			"q": "给仓库写一条 conventional commit",
+			"expect": ["git-commit"],
+			"mustNot": ["pptx"]
+		},
+		{
+			"id": "crawl-page",
+			"q": "抓一下这个网页的内容并总结",
+			"expect": ["firecrawl", "web-fetch"],
+			"mustNot": ["pdf-tools"]
+		},
+		{
+			"id": "docx-to-markdown",
+			"q": "把 Word 文档转成 markdown",
+			"expect": ["docx", "word-tools"],
+			"mustNot": ["pptx"]
+		},
+		{
+			"id": "publication-plot",
+			"q": "画一张出版级的折线图",
+			"expect": ["matplotlib"],
+			"mustNot": ["pptx"]
+		},
+		{
+			"id": "paper-citation",
+			"q": "查一下这篇论文的 DOI 和引用格式",
+			"expect": ["citation"],
+			"mustNot": ["pptx"]
+		},
+		{
+			"id": "react-a11y",
+			"q": "给 React 项目做可访问性检查",
+			"expect": ["web-a11y"],
+			"mustNot": ["pptx"]
+		},
+		{
+			"id": "code-review",
+			"q": "把这个仓库的代码审查一遍",
+			"expect": ["code-review"],
+			"mustNot": ["xlsx"]
+		},
+		{
+			"id": "train-agent-sb3",
+			"q": "用 stable baselines3 训练一个强化学习智能体",
+			"expect": ["stable-baselines3"],
+			"mustNot": ["pdf-tools"]
+		},
+		{
+			"id": "literature",
+			"q": "帮我做一次文献综述，把相关论文整理出来",
+			"expect": ["literature-review"],
+			"mustNot": ["pptx"]
+		},
+		{
+			"id": "excel-report",
+			"q": "生成一个 Excel 报表",
+			"expect": ["xlsx"],
+			"mustNot": ["pdf-tools"]
+		},
+		{
+			"id": "distinct-ui",
+			"q": "这个界面太像模板了，帮我设计得更有辨识度",
+			"expect": ["frontend-design"],
+			"mustNot": ["xlsx"]
+		},
+		{
+			"id": "write-skill",
+			"q": "帮我写一个 SKILL.md",
+			"expect": ["skill-creator"],
+			"mustNot": ["pptx"]
+		},
+		{
+			"id": "followup-ppo",
+			"messages": ["帮我排查 PPO 训练 reward 突然下降的原因", "这个呢", "好的", "继续"],
+			"expect": ["train-debug", "stable-baselines3"],
+			"mustNot": ["pptx", "xlsx"]
+		},
+		{
+			"id": "followup-plot",
+			"messages": ["画一张出版级的折线图", "继续"],
+			"expect": ["matplotlib"],
+			"mustNot": ["pptx"]
+		},
+		{
+			"id": "mixed-language",
+			"q": "RL 训练时 KL 散度炸了，reward 崩了",
+			"expect": ["train-debug", "stable-baselines3"],
+			"mustNot": ["pptx"]
+		},
+		{
+			"id": "no-fit-robot",
+			"q": "帮我控制机械臂抓取桌上的物体",
+			"expectNone": true
+		},
+		{
+			"id": "no-fit-horoscope",
+			"q": "根据我的星座运势安排今天的日程",
+			"expectNone": true
+		},
+		{
+			"id": "no-fit-translate",
+			"q": "帮我翻译这段冰岛语的合同",
+			"expectNone": true
+		},
+		{
+			"id": "installed-pdf",
+			"q": "把这个 PDF 里的表格抽出来",
+			"installed": ["pdf-tools"],
+			"expectInstalledHits": ["pdf-tools"],
+			"mustNot": ["pdf-tools"]
+		},
+		{
+			"id": "installed-plot",
+			"q": "画一张出版级的折线图",
+			"installed": ["matplotlib"],
+			"expectInstalledHits": ["matplotlib"],
+			"mustNot": ["matplotlib"]
+		},
+		{
+			"id": "not-crowd-out",
+			"q": "把这个 PDF 里的表格抽出来",
+			"expect": ["pdf-tools", "pdf"],
+			"mustNot": ["pptx", "xlsx", "matplotlib"]
+		}
+	]
+}

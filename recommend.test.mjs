@@ -109,6 +109,39 @@ const REPO_ZIP = buildZip([
 	{ name: "repo-main/README.md", data: "# repo" },
 ]);
 
+/** 带限制/依赖/IO 的技能：验证精排能看到这些字段（不被截掉）。 */
+const RICH_ZIP = buildZip([
+	{
+		name: "repo-main/skills/train-debug/SKILL.md",
+		data: [
+			"---",
+			"name: train-debug",
+			"description: 诊断强化学习训练不稳定：reward 突然下降、KL 爆炸时使用。",
+			"---",
+			"## 输入",
+			"- 输入：训练日志目录。",
+			"- 输出：诊断报告。",
+			"## 限制",
+			"- 不支持多机训练",
+			"- 仅支持 PyTorch 训练日志",
+			"安装依赖：pip install tensorboard",
+		].join("\n"),
+	},
+	{
+		name: "repo-main/skills/paper/SKILL.md",
+		data: [
+			"---",
+			"name: pdf-tools",
+			"description: 从 PDF 提取文本与表格，当用户需要读取、转换或检查 PDF 时使用。",
+			"---",
+			"## 使用",
+			"- 输入：PDF 文件。",
+			"- 输出：Markdown 表格。",
+			"- 不支持扫描件 OCR",
+		].join("\n"),
+	},
+]);
+
 describe("仓库索引", () => {
 	it("解析仓库写法", () => {
 		assert.deepEqual(parseRepoSpec("anthropics/skills"), { owner: "anthropics", repo: "skills", ref: "" });
@@ -124,17 +157,20 @@ describe("仓库索引", () => {
 		assert.equal(defaults[0], "anthropics/skills");
 	});
 
-	it("从文件树里提取 name/description，跳过重复与无描述", () => {
+	it("从文件树里提取 name/description：同名不同目录各自一条（用 id 区分），无描述跳过", () => {
 		const files = packFrom({
 			"skills/a/SKILL.md": "---\nname: a\ndescription: A 技能，当需要 a 时使用。\n---\n",
-			"skills/b/SKILL.md": "---\nname: a\ndescription: 重名，应该被跳过。\n---\n",
+			"skills/b/SKILL.md": "---\nname: a\ndescription: 另一个仓库版本的 a。\n---\n",
 			"skills/c/SKILL.md": "---\nname: c\n---\n",
 			"README.md": "# x",
 		});
 		const entries = entriesFromTree(files, "o/r", "main");
-		assert.deepEqual(entries.map((e) => e.name), ["a"]);
+		// 不再按 name 合并：同名但不同目录是不同条目（能力可能不一样）
+		assert.deepEqual(entries.map((e) => e.name), ["a", "a"]);
+		assert.deepEqual(entries.map((e) => e.id).sort(), ["o/r@main:skills/a", "o/r@main:skills/b"]);
 		assert.equal(entries[0].path, "skills/a");
 		assert.equal(entries[0].ref, "main");
+		assert.ok(!entries.some((e) => e.name === "c"), "没 description 的要跳过");
 	});
 
 	it("仓库没新提交时复用上次条目，不再下载", async () => {
@@ -217,6 +253,23 @@ describe("仓库索引", () => {
 		assert.ok(!calls.some((u) => u.includes("codeload")), "不该下载 zip");
 	});
 
+	it("同仓库不同 ref 的缓存互不覆盖，刷新后也不会串分支", async () => {
+		const makeZip = (ref) => buildZip([{ name: `r-${ref}/skills/dup/SKILL.md`, data: `---\nname: dup\ndescription: ${ref} 分支的 PDF 提取技能\n---\n` }]);
+		let calls = 0;
+		const http = { get: async (url) => {
+			calls++;
+			return url.includes("api.github.com") ? { ok: true, buffer: Buffer.from('{"pushed_at":"t1"}') } : { ok: true, buffer: makeZip(url.includes("v2") ? "v2" : "main") };
+		} };
+		const first = await buildIndex({ sources: ["o/r#main", "o/r#v2"], http });
+		assert.deepEqual(new Set(first.entries.map((e) => e.ref)), new Set(["main", "v2"]));
+		assert.equal(first.perSource["o/r#main"].entries[0].ref, "main");
+		assert.equal(first.perSource["o/r#v2"].entries[0].ref, "v2");
+		calls = 0;
+		const second = await buildIndex({ sources: ["o/r#main", "o/r#v2"], http, previous: first });
+		assert.equal(calls, 0);
+		assert.deepEqual(new Set(second.entries.map((e) => e.ref)), new Set(["main", "v2"]));
+	});
+
 	it("buildIndex 汇总多个仓库并记录错误", async () => {
 		const http = fakeHttp(REPO_ZIP);
 		const index = await buildIndex({ sources: ["o/r", "bad"], http });
@@ -230,7 +283,7 @@ describe("仓库索引", () => {
 
 // ---------- 推荐服务 ----------
 
-async function setup({ settings = {}, messages = [], llm = null } = {}) {
+async function setup({ settings = {}, messages = [], llm = null, zip = null, sources = "o/r", http: httpOverride = null } = {}) {
 	const root = await mkdtemp(join(tmpdir(), "si-rec-"));
 	const skillsDir = join(root, ".pi", "skills");
 	const globalDir = join(root, "global-skills");
@@ -238,11 +291,12 @@ async function setup({ settings = {}, messages = [], llm = null } = {}) {
 	const host = {
 		...base,
 		dataDir: root,
-		getSettings: () => ({ repos: "o/r", topN: 3, rerank: false, ...settings }),
+		cwd: root,
+		getSettings: () => ({ repos: sources, topN: 3, rerank: false, ...settings }),
 		getActiveConversation: () => ({ title: "测试会话", messages }),
 		...(llm ? { llm: { complete: llm } } : {}),
 	};
-	const http = fakeHttp(REPO_ZIP);
+	const http = httpOverride ?? fakeHttp(zip ?? REPO_ZIP);
 	const ops = createOps(host);
 	const getScopes = () => makeScopes(host, skillsDir, globalDir);
 	const importService = createImportService({ host, http, ops, getScopes });
@@ -358,6 +412,8 @@ describe("推荐服务", () => {
 			const res = await service.installRecommended({ name: "pdf-tools", scopeId: "project" });
 			assert.equal(res.ok, true, res.error);
 			assert.match(await readFile(join(skillsDir, "pdf-tools", "SKILL.md"), "utf8"), /pdf-tools/);
+			// 装完要能被页面标成「等待重新加载」
+			assert.deepEqual(res.reload.names, ["pdf-tools"]);
 
 			const again = await service.installRecommended({ name: "pdf-tools", scopeId: "project" });
 			assert.equal(again.ok, false);
@@ -366,6 +422,215 @@ describe("推荐服务", () => {
 			const missing = await service.installRecommended({ name: "nope", scopeId: "project" });
 			assert.equal(missing.ok, false);
 			assert.match(missing.error, /索引里没有/);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("短回复沿用最近一次明确任务，PPO 不会丢", async () => {
+		const { root, service } = await setup({
+			messages: [
+				{ role: "user", text: "帮我排查 PPO 训练 reward 突然下降的原因" },
+				{ role: "assistant", text: "先看 reward 曲线" },
+				{ role: "user", text: "这个呢" },
+				{ role: "user", text: "好的" },
+				{ role: "user", text: "继续" },
+			],
+		});
+		try {
+			const res = await service.recommend({ force: true });
+			assert.match(res.task.text, /PPO/);
+			assert.equal(res.task.mode, "inherited");
+			assert.ok(res.task.keywords.includes("ppo"), `关键词：${res.task.keywords.join(",")}`);
+			assert.ok(!res.task.keywords.includes("继续"), "承接语不该污染查询");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("页面改过的需求优先于当前对话，并标记 edited", async () => {
+		const { root, service } = await setup({
+			messages: [{ role: "user", content: "帮我把 PDF 里的表格抽出来" }],
+		});
+		try {
+			const res = await service.recommend({ force: true, q: "写一条 conventional commit" });
+			assert.equal(res.task.edited, true);
+			assert.match(res.task.text, /conventional commit/);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("已装命中区分 已启用 / 已停用 / 等待重新加载", async () => {
+		const { root, service, importService } = await setup({
+			messages: [{ role: "user", content: "帮我把 PDF 里的表格抽出来" }],
+		});
+		try {
+			const p = await importService.preview({ source: "o/r", path: "skills/demo" });
+			await importService.install({ token: p.token, scopeId: "project" });
+			service.noteChange({ name: "pdf-tools", kind: "install" });
+
+			const reloading = await service.recommend({ force: true });
+			assert.equal(reloading.installedHits[0].status, "reloading");
+			assert.match(reloading.installedHits[0].note, /等待重新加载/);
+			assert.deepEqual(reloading.reload.names, ["pdf-tools"]);
+
+			// 点「已重新加载」后变成已启用
+			service.ackReload();
+			const enabled = await service.recommend();
+			assert.equal(enabled.installedHits[0].status, "enabled");
+			assert.equal(enabled.installedHits[0].scopeId, "project");
+			assert.match(enabled.installedHits[0].note, /已启用/);
+
+			// 停用后不能再告诉用户「已装可直接用」
+			await importService.setEnabled({ name: "pdf-tools", scopeId: "project", enabled: false });
+			const disabled = await service.recommend();
+			assert.equal(disabled.installedHits[0].status, "disabled");
+			assert.match(disabled.installedHits[0].note, /停用/);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("精排输入带上已装能力摘要与候选的限制/依赖", async () => {
+		const prompts = [];
+		const { root, service, importService } = await setup({
+			settings: { rerank: true },
+			zip: RICH_ZIP,
+			messages: [{ role: "user", text: "PPO 训练 reward 突然下降，帮我看训练日志" }],
+			llm: async ({ prompt }) => {
+				prompts.push(prompt);
+				return { ok: true, text: '{"picks":[]}' };
+			},
+		});
+		try {
+			const p = await importService.preview({ source: "o/r", path: "skills/paper" });
+			assert.equal(p.ok, true, p.error);
+			await importService.install({ token: p.token, scopeId: "project" });
+
+			await service.recommend({ force: true });
+			const rerankPrompt = prompts.find((x) => x.includes("候选技能"));
+			assert.ok(rerankPrompt, "应该调过精排");
+			// 已装技能：不只名字，要有能力、启用状态、限制、依赖（且依赖不可验证时如实标注）
+			assert.match(rerankPrompt, /pdf-tools（磁盘已启用，加载未验证）/);
+			assert.match(rerankPrompt, /任务: /);
+			// 候选：限制与依赖不能被截掉
+			assert.match(rerankPrompt, /不支持多机训练/);
+			assert.match(rerankPrompt, /tensorboard/);
+			assert.match(rerankPrompt, /输入输出: /);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("过期或旧 schema 索引也不会让重新推荐隐式联网", async () => {
+		const { root, service, host, http } = await setup({ messages: [{ role: "user", text: "读取 PDF 表格" }] });
+		try {
+			await service.recommend({ force: true });
+			const old = host.storage.get("catalog");
+			host.storage.set("catalog", { ...old, at: 1, schema: 2 });
+			service._reset();
+			http.get = async () => { throw new Error("不应请求网络"); };
+			const result = await service.recommend();
+			assert.equal(result.items[0].name, "pdf-tools");
+			assert.equal(result.indexNeedsUpdate, true);
+		} finally { await rm(root, { recursive: true, force: true }); }
+	});
+
+	it("旧 schema 遇到 GitHub 限流时无损迁移，不丢原来的源条目", async () => {
+		const { root, service, host, http } = await setup();
+		try {
+			const entry = { name: "pdf-tools", repo: "o/r", path: "skills/pdf", ref: "", description: "提取 PDF 表格" };
+			host.storage.set("catalog", { schema: 2, at: 1, sources: ["o/r"], entries: [entry], perSource: { "o/r": { entries: [entry], metaAt: 0 } } });
+			http.get = async () => ({ ok: false, error: "HTTP 403 rate limit exceeded" });
+			const index = await service.ensureIndex({ force: true });
+			assert.equal(index.schema, 3);
+			assert.equal(index.entries.length, 1);
+			assert.equal(index.entries[0].id, "o/r@HEAD:skills/pdf");
+			assert.match(index.errors.join(" "), /rate limit/);
+		} finally { await rm(root, { recursive: true, force: true }); }
+	});
+
+	it("待重载清单按项目和对话隔离，确认 B 不会清掉 A", async () => {
+		const { root, service, host } = await setup();
+		try {
+			let id = "a";
+			host.getActiveConversation = () => ({ conversationId: id, messages: [] });
+			host.cwd = `${root}/a`;
+			service.noteChange({ name: "pdf", scopeId: "project" });
+			id = "b"; host.cwd = `${root}/b`;
+			assert.deepEqual(service.pending().names, []);
+			service.noteChange({ name: "plot", scopeId: "project" });
+			assert.deepEqual(service.ackReload().cleared, ["plot"]);
+			id = "a"; host.cwd = `${root}/a`;
+			assert.deepEqual(service.pending().names, ["pdf"]);
+		} finally { await rm(root, { recursive: true, force: true }); }
+	});
+
+	it("已装能力读本机文档；不可读时不会借网上同名技能补全", async () => {
+		const prompts = [];
+		const { root, service, importService, host } = await setup({
+			settings: { rerank: true }, zip: RICH_ZIP,
+			messages: [{ role: "user", text: "PPO 训练 reward 下降，分析训练日志" }],
+			llm: async ({ prompt }) => { prompts.push(prompt); return { ok: true, text: '{"picks":[]}' }; },
+		});
+		try {
+			const preview = await importService.preview({ source: "o/r", path: "skills/paper" });
+			await importService.install({ token: preview.token, scopeId: "project" });
+			const path = join(root, ".pi/skills/pdf-tools/SKILL.md");
+			await writeFile(path, "---\nname: pdf-tools\ndescription: 分析 PPO 训练日志的本机版本\n---\n- 不支持远程日志\npip install local-only-package\n");
+			service.noteChange({ name: "pdf-tools", scopeId: "project" });
+			await service.recommend({ force: true });
+			const line = prompts.findLast((p) => p.includes("候选技能")).split("\n").find((l) => l.startsWith("- pdf-tools"));
+			assert.match(line, /等待重载/);
+			assert.match(line, /本机版本/);
+			assert.match(line, /不支持远程日志/);
+			assert.match(line, /local-only-package\(未验证\)/);
+			const read = host.fs.readTextPath;
+			host.fs.readTextPath = async (file) => { if (file === path) throw new Error("denied"); return read(file); };
+			await service.recommend();
+			const unknown = prompts.findLast((p) => p.includes("候选技能")).split("\n").find((l) => l.startsWith("- pdf-tools"));
+			assert.match(unknown, /任务: 未声明/);
+			assert.ok(!unknown.includes("从 PDF 提取"));
+		} finally { await rm(root, { recursive: true, force: true }); }
+	});
+
+	it("同名技能来自两个仓库：都进索引，展示时归组变体，可按 id 装指定版本", async () => {
+		const zipA = buildZip([
+			{ name: "a-main/skills/dup/SKILL.md", data: "---\nname: dup\ndescription: 从 PDF 抽表格的 A 版本\n---\n" },
+		]);
+		const zipB = buildZip([
+			{ name: "b-main/skills/dup/SKILL.md", data: "---\nname: dup\ndescription: 从 PDF 抽表格的 B 版本\n---\n" },
+		]);
+		const http = {
+			get: async (url) => {
+				if (url.includes("api.github.com")) {
+					return { ok: true, buffer: Buffer.from(JSON.stringify({ pushed_at: "t1" })) };
+				}
+				return { ok: true, buffer: url.includes("o/b") ? zipB : zipA };
+			},
+		};
+		const { root, service, host } = await setup({
+			settings: { rerank: false },
+			sources: "o/a, o/b",
+			http,
+			messages: [{ role: "user", text: "把 PDF 表格抽出来" }],
+		});
+		try {
+			const index = await service.ensureIndex({ force: true });
+			assert.equal(index.entries.filter((e) => e.name === "dup").length, 2, "同名不同仓库都要留在索引里");
+
+			const res = await service.recommend();
+			const dup = res.items.find((i) => i.name === "dup");
+			assert.ok(dup, "应该有 dup 候选");
+			assert.equal(dup.variants.length, 1, "另一仓库的版本应作为变体出现");
+			assert.equal(dup.variants[0].repo, "o/b");
+
+			// 用 id 指定就装 B 仓库那份
+			const variant = dup.variants[0];
+			const installed = await service.installRecommended({ id: variant.id, name: "dup", scopeId: "project" });
+			assert.equal(installed.ok, true, installed.error);
+			assert.match(await readFile(join(host.root, ".pi", "skills", "dup", "SKILL.md"), "utf8"), /B 版本/);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
@@ -479,28 +744,56 @@ describe("忽略与钉住", () => {
 		}
 	});
 
-	it("钉住的排最前，且与忽略互斥", async () => {
+	it("钉住是独立收藏区，不占任务推荐名额，且与忽略互斥", async () => {
 		const { root, service, host } = await setup({
+			settings: { topN: 1 },
 			messages: [{ role: "user", content: "帮我把 PDF 里的表格抽出来" }],
 		});
 		try {
 			await service.recommend({ force: true });
-			const pin = service.setFeedback({ action: "pin", name: "other" });
-			assert.equal(pin.ok, true);
+			const pin = service.setFeedback({ op: "pin", name: "other" });
+			assert.equal(pin.ok, true, "客户端传 op 也要能认");
 
 			const res = await service.recommend();
-			assert.equal(res.items[0].name, "other");
-			assert.equal(res.items[0].pinned, true);
+			// 钉住的另一条进独立收藏区，任务推荐照旧给 pdf-tools
+			assert.deepEqual(res.pinned.map((p) => p.name), ["other"]);
+			assert.equal(res.pinned[0].pinned, true);
+			assert.equal(res.items[0].name, "pdf-tools", "钉住的不该把推荐挤掉");
+			assert.ok(!res.items.some((i) => i.name === "other"));
 			assert.deepEqual(res.feedback.pinned, ["other"]);
 
 			// 钉住应清掉同名的忽略标记，反之亦然
 			service.setFeedback({ action: "ignore", name: "other" });
 			assert.deepEqual(JSON.parse(JSON.stringify(host.storage.get("feedback"))).pinned, {});
 			const after = await service.recommend();
+			assert.ok(!after.pinned.some((p) => p.name === "other"));
 			assert.ok(!after.items.some((i) => i.name === "other"));
+
+			service.setFeedback({ action: "pin", name: "other" });
+			service.setFeedback({ action: "unpin", name: "other" });
+			assert.deepEqual((await service.recommend()).pinned, []);
 
 			const bad = service.setFeedback({ action: "explode", name: "x" });
 			assert.equal(bad.ok, false);
+			assert.match(bad.error, /未知操作/);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("钉三条也不会把推荐占满（收藏与推荐分开口径）", async () => {
+		const { root, service } = await setup({
+			settings: { topN: 3 },
+			messages: [{ role: "user", content: "帮我把 PDF 里的表格抽出来" }],
+		});
+		try {
+			await service.recommend({ force: true });
+			for (const name of ["other", "pdf-tools"]) service.setFeedback({ op: "pin", name });
+			const res = await service.recommend();
+			assert.ok(res.pinned.length >= 1);
+			// pdf-tools 已钉住仍在 pinned，items 里只剩真正可装的其它候选（这里没有）
+			assert.ok(!res.items.some((i) => i.name === "pdf-tools"), "已钉住的不再重复进 items");
+			assert.ok(res.items.length <= 3);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
