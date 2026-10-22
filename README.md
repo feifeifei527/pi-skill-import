@@ -214,3 +214,10 @@ UI 显示「已装可直接用」。
 - `host.net.fetch` 只回 512KB 文本，装不下 zipball，所以 `server/http.cjs` 走
   进程内 fetch，但先过 `manifest.netAllowlist` / `host.requestPermission` 同口径校验。
 - 备份/暂存目录用 `.` 开头（Pi 的扫描会跳过点开头条目），每个技能只留最近 2 份备份。
+
+## License
+
+MIT — 见 [LICENSE](LICENSE)。
+
+`sdk/` 与 `client/sdk/` 是 pi-web-ui 的 plugin-sdk 拷贝（同样 MIT，
+Copyright (c) 2026 xing-shuyin），随插件分发以便离线安装。
