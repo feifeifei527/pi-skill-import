@@ -26,7 +26,9 @@ describe("skill-import 第 1 步：探测与授权", () => {
 			"GET /list",
 			"GET /probe",
 			"GET /recommend",
+			"GET /reload",
 			"GET /sources",
+			"POST /ack-reload",
 			"POST /feedback",
 			"POST /install",
 			"POST /preview",
@@ -170,6 +172,61 @@ describe("skill-import 第 1 步：探测与授权", () => {
 		assert.match(asked[0].reason, /技能/);
 		assert.equal(notices[0].level, "info");
 		assert.equal(sent.at(-1).type, "probe");
+	});
+
+	it("反馈消息里的 op 被归一成 action（钉住 / 不感兴趣不再是未知操作）", async () => {
+		const sent = [];
+		const host = createMockHost({ cwd: CWD, broadcast: (payload) => sent.push(payload) });
+		await plugin.activate(host);
+
+		await host.mock.emitAsync("onMessage", { action: "skill-import:feedback", op: "pin", name: "pdf-tools" });
+		assert.equal(sent.at(-1).type, "feedback");
+		assert.equal(sent.at(-1).data.ok, true, JSON.stringify(sent.at(-1).data));
+		assert.deepEqual(sent.at(-1).data.feedback.pinned, ["pdf-tools"]);
+
+		await host.mock.emitAsync("onMessage", { action: "skill-import:feedback", op: "unpin", name: "pdf-tools" });
+		assert.deepEqual(sent.at(-1).data.feedback.pinned, []);
+
+		await host.mock.emitAsync("onMessage", { action: "skill-import:feedback", op: "ignore", name: "pdf-tools" });
+		assert.deepEqual(sent.at(-1).data.feedback.ignored, ["pdf-tools"]);
+		await host.mock.emitAsync("onMessage", { action: "skill-import:feedback", op: "unignore", name: "pdf-tools" });
+		assert.deepEqual(sent.at(-1).data.feedback.ignored, []);
+
+		// 没带操作 → 明确的错误，而不是把路由动作当成反馈动作
+		await host.mock.emitAsync("onMessage", { action: "skill-import:feedback", name: "x" });
+		assert.equal(sent.at(-1).data.ok, false);
+		assert.match(sent.at(-1).data.error, /未知操作/);
+	});
+
+	it("页面发的每个动作服务端都有分支（前后端消息契约）", async () => {
+		const [clientSrc, implSrc] = await Promise.all([
+			readFile(new URL("./client/entry.mjs", import.meta.url), "utf8"),
+			readFile(new URL("./server/impl.cjs", import.meta.url), "utf8"),
+		]);
+		const sent = [...new Set([...clientSrc.matchAll(/action:\s*"(skill-import:[^"]+)"/g)].map((m) => m[1]))].sort();
+		const handled = new Set([...implSrc.matchAll(/case "(skill-import:[^"]+)"/g)].map((m) => m[1]));
+		assert.ok(sent.length >= 10, `页面动作太少了：${sent.join(", ")}`);
+		for (const action of sent) assert.ok(handled.has(action), `服务端没处理页面发的 ${action}`);
+
+		// 反馈操作只能用服务端认识的四个动词
+		const ops = [...new Set([...clientSrc.matchAll(/op:\s*"(\w+)"/g)].map((m) => m[1]))];
+		assert.ok(ops.length >= 4);
+		for (const op of ops) assert.ok(["ignore", "unignore", "pin", "unpin"].includes(op), `未知反馈操作 ${op}`);
+	});
+
+	it("待重载清单：装上技能后记一笔，确认重载后清空", async () => {
+		const sent = [];
+		const host = createMockHost({ cwd: CWD, broadcast: (payload) => sent.push(payload) });
+		await plugin.activate(host);
+
+		await host.mock.emitAsync("onMessage", { action: "skill-import:ack-reload" });
+		assert.equal(sent.at(-1).type, "ack-reload");
+		assert.deepEqual(sent.at(-1).data.cleared, []);
+
+		const routes = host.mock.routes.map((r) => `${r.method} ${r.path}`);
+		assert.ok(routes.includes("GET /reload"));
+		assert.ok(routes.includes("POST /ack-reload"));
+		assert.ok(routes.includes("POST /feedback"));
 	});
 
 	it("动作里抛错时转成 error 广播，且不炸 handler", async () => {

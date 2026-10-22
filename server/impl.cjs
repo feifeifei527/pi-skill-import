@@ -6,6 +6,7 @@
  * 可以手动清，于是入口每次 activate 前清一遍本目录缓存，热重载才是真的。
  */
 const { readFileSync } = require("node:fs");
+const { randomUUID } = require("node:crypto");
 const { homedir } = require("node:os");
 const { join } = require("node:path");
 
@@ -15,6 +16,7 @@ const { createImportService } = require("./import-service.cjs");
 const { registerAgentSurface } = require("./agent-bridge.cjs");
 const { writeZip } = require("../core/zip-write.cjs");
 const { createRecommendService } = require("./recommend.cjs");
+const { createRequestContext } = require("./context.cjs");
 
 const HOME = homedir();
 /** Pi 的 agent 目录：优先 env（pi 自己也认这个），否则 ~/.pi/agent。 */
@@ -33,9 +35,9 @@ const NET_ALLOWLIST = Array.isArray(MANIFEST.netAllowlist) ? MANIFEST.netAllowli
 function scopesFor(cwd) {
 	return [
 		{ id: "global", label: "全局 · Pi", writable: true, path: join(AGENT_DIR, "skills") },
-		{ id: "project", label: "项目 · .pi", writable: true, path: join(cwd, ".pi", "skills") },
+		...(cwd ? [{ id: "project", label: "项目 · .pi", writable: true, path: join(cwd, ".pi", "skills") }] : []),
 		{ id: "agents-global", label: "全局 · .agents", writable: false, path: join(HOME, ".agents", "skills") },
-		{ id: "agents-project", label: "项目 · .agents", writable: false, path: join(cwd, ".agents", "skills") },
+		...(cwd ? [{ id: "agents-project", label: "项目 · .agents", writable: false, path: join(cwd, ".agents", "skills") }] : []),
 	];
 }
 
@@ -107,6 +109,7 @@ async function probe(host) {
 	}
 	return {
 		cwd,
+		conversationId: host.getActiveConversation?.()?.conversationId ?? "",
 		agentDir: AGENT_DIR,
 		dataDir: String(host.dataDir ?? ""),
 		node: typeof process !== "undefined" ? process.version : "",
@@ -116,7 +119,9 @@ async function probe(host) {
 	};
 }
 
-async function activate(host) {
+async function activate(baseHost) {
+	const requestContext = createRequestContext(baseHost);
+	const host = requestContext.host;
 	host.log("info", "skill-import 已激活", { agentDir: AGENT_DIR, netAllowlist: NET_ALLOWLIST });
 
 	const http = createHttp({ host, allowlist: NET_ALLOWLIST });
@@ -125,45 +130,91 @@ async function activate(host) {
 	const service = createImportService({ host, http, ops, getScopes });
 	const recommendService = createRecommendService({ host, http, getScopes, importService: service });
 
+	// 变更记账：装完/启停后列表里能直接显示「等待重新加载」
+	const noteChange = (name, kind, scopeId) => {
+		try {
+			return recommendService.noteChange({ name, kind, scopeId });
+		} catch (err) {
+			host.log("warn", "记录重载待办失败", errText(err));
+			return { ok: false, reload: undefined };
+		}
+	};
+	const changed = (data, kind) => data.ok && !data.unchanged
+		? { ...data, reload: noteChange(data.name, kind, data.scopeId).reload }
+		: data;
+	// 下载走 HTTP，用短期随机句柄携带已确认的项目上下文，不重新读全局 cwd。
+	const downloadContexts = new Map();
+	const rememberDownloadContext = () => {
+		for (const [key, value] of downloadContexts) if (value.expires <= Date.now()) downloadContexts.delete(key);
+		if (downloadContexts.size >= 200) downloadContexts.delete(downloadContexts.keys().next().value);
+		const token = randomUUID();
+		downloadContexts.set(token, { context: requestContext.capture(), expires: Date.now() + 15 * 60_000 });
+		return token;
+	};
+	// 所有对外探测回包使用同一契约，授权成功或拒绝都不能让页面丢失下载句柄。
+	// 内部 getScopes 继续使用纯 probe，避免每次读落点都创建句柄。
+	const probeWithDownloadContext = async () => ({ ...await probe(host), downloadContext: rememberDownloadContext() });
+	const FEEDBACK_VERBS = new Set(["ignore", "unignore", "pin", "unpin"]);
+	const isFeedbackVerb = (value) => FEEDBACK_VERBS.has(String(value ?? "").trim().toLowerCase());
+
 	// 对话侧入口：ai 工具 + 斜杠命令（和页面共用同一个 service）
 	const offAgent = registerAgentSurface({ host, service });
 
 	const handle = async (action, payload) => {
+		if (!host.cwd && /project/.test(String(payload?.scopeId ?? ""))) {
+			return { type: "error", message: "无法确认当前对话的项目目录；请重新打开技能面板，或明确选择全局安装。" };
+		}
 		switch (action) {
 			case "skill-import:probe":
-				return { type: "probe", data: await probe(host) };
+				return { type: "probe", data: await probeWithDownloadContext() };
 			case "skill-import:grant": {
 				const dir = String(payload?.path ?? "").trim();
 				if (!dir) return { type: "error", message: "缺少目录" };
 				const ok = await host.fs.requestAccess(dir, "技能导入需要读写这个技能目录");
 				host.notify(ok ? "info" : "warning", ok ? `已授权：${dir}` : `授权被拒绝：${dir}`);
-				return { type: "probe", data: await probe(host) };
+				return { type: "probe", data: await probeWithDownloadContext() };
 			}
 			case "skill-import:preview":
 				return { type: "preview", data: await service.preview(payload ?? {}) };
-			case "skill-import:install":
-				return { type: "install", data: await service.install(payload ?? {}) };
+			case "skill-import:install": {
+				const data = await service.install(payload ?? {});
+				return { type: "install", data: changed(data, "install") };
+			}
 			case "skill-import:rollback":
-				return { type: "rollback", data: await service.rollback(payload ?? {}) };
+				return { type: "rollback", data: changed(await service.rollback(payload ?? {}), "rollback") };
 			case "skill-import:list":
 				return { type: "list", data: await service.listInstalled() };
 			case "skill-import:check-updates":
 				return { type: "updates", data: await service.checkUpdates() };
-			case "skill-import:update":
-				return { type: "update", data: await service.update(payload ?? {}) };
+			case "skill-import:update": {
+				const data = await service.update(payload ?? {});
+				return { type: "update", data: changed(data, "update") };
+			}
 			case "skill-import:health":
 				return { type: "health", data: await service.health() };
-			case "skill-import:set-enabled":
-				return { type: "toggle", data: await service.setEnabled(payload ?? {}) };
-			case "skill-import:remove":
-				return { type: "remove", data: await service.removeSkill(payload ?? {}) };
+			case "skill-import:set-enabled": {
+				const data = await service.setEnabled(payload ?? {});
+				return { type: "toggle", data: changed(data, data.enabled ? "enable" : "disable") };
+			}
+			case "skill-import:remove": {
+				const data = await service.removeSkill(payload ?? {});
+				return { type: "remove", data: changed(data, "remove") };
+			}
 			case "skill-import:recommend":
 				return {
 					type: "recommend",
-					data: await recommendService.recommend({ force: payload?.force === true, q: payload?.q }),
+					data: await recommendService.recommend({
+						force: payload?.force === true,
+						q: payload?.q ?? payload?.query,
+					}),
 				};
-			case "skill-import:recommend-install":
-				return { type: "recommend-install", data: await recommendService.installRecommended(payload ?? {}) };
+			case "skill-import:recommend-install": {
+				const data = await recommendService.installRecommended(payload ?? {});
+				// 回显 requestId：页面取消后重试时，能区分是哪一次请求的结果
+				return { type: "recommend-install", requestId: payload?.requestId, data };
+			}
+			case "skill-import:ack-reload":
+				return { type: "ack-reload", data: recommendService.ackReload() };
 			case "skill-import:sources":
 				return { type: "sources", data: await recommendService.listSources() };
 			case "skill-import:source-add":
@@ -172,22 +223,39 @@ async function activate(host) {
 				return { type: "source-change", data: await recommendService.removeSource(payload ?? {}) };
 			case "skill-import:discover":
 				return { type: "discover", data: await recommendService.discover() };
-			case "skill-import:feedback":
-				return { type: "feedback", data: recommendService.setFeedback(payload ?? {}) };
+			case "skill-import:feedback": {
+				// 客户端把操作放在 op（路由字段叫 action），HTTP 侧习惯用 action；这里统一成 op
+				const op = payload?.op ?? payload?.verb ?? payload?.feedbackAction ?? payload?.feedback?.op;
+				const feedbackAction = op !== undefined ? op : isFeedbackVerb(payload?.action) ? payload.action : undefined;
+				if (!feedbackAction) {
+					return { type: "feedback", data: { ok: false, error: "未知操作（ignore / unignore / pin / unpin）", received: String(payload?.action ?? "") } };
+				}
+				return {
+					type: "feedback",
+					data: recommendService.setFeedback({ action: feedbackAction, name: payload?.name, id: payload?.id }),
+				};
+			}
 			default:
 				return null;
 		}
 	};
 
 	// 客户端 → 服务端（窄通道）
-	const offMessage = host.onMessage(async (payload) => {
+	const offMessage = host.onMessage(async (payload, from) => {
 		const action = String(payload?.action ?? "");
+		const replyToSender = (reply) => from && typeof host.sendTo === "function" ? host.sendTo(from, reply) : host.broadcast(reply);
 		try {
-			const reply = await handle(action, payload ?? {});
-			if (reply) host.broadcast(reply);
+			await requestContext.run(from, async () => {
+				const reply = await handle(action, payload ?? {});
+				if (!reply) return;
+				// 一定要回包：静默丢弃会让页面永远停在「安装中」。旧对话的回包带 conversationId，
+				// 由页面自己去重，而不是服务端扣住不发。
+				const conversationId = requestContext.capture().snapshot?.conversationId ?? "";
+				replyToSender(conversationId ? { ...reply, conversationId } : reply);
+			}, { projectDir: payload?.projectDir });
 		} catch (err) {
 			host.log("error", `${action || "(空动作)"} 失败`, errText(err));
-			host.broadcast({ type: "error", action, message: errText(err) });
+			replyToSender({ type: "error", action, message: errText(err) });
 		}
 	});
 
@@ -197,7 +265,8 @@ async function activate(host) {
 	};
 	const safe = (fn) => async (req, res) => {
 		try {
-			await fn(req, res);
+			// HTTP 调用没有 clientId：允许 ?projectDir= 或 body.projectDir 指定项目落点
+			await requestContext.withProjectDir(req.query?.projectDir ?? req.body?.projectDir, () => fn(req, res));
 		} catch (err) {
 			host.log("error", "route 失败", errText(err));
 			if (!res.headersSent) json(res, { ok: false, error: errText(err) }, 500);
@@ -208,7 +277,7 @@ async function activate(host) {
 		host.route(
 			"GET",
 			"/probe",
-			safe(async (_req, res) => json(res, await probe(host))),
+			safe(async (req, res) => json(res, await requestContext.withProjectDir(req.query?.projectDir, () => probeWithDownloadContext()))),
 		),
 		host.route(
 			"POST",
@@ -218,12 +287,12 @@ async function activate(host) {
 		host.route(
 			"POST",
 			"/install",
-			safe(async (req, res) => json(res, await service.install(req.body ?? {}))),
+			safe(async (req, res) => json(res, (await handle("skill-import:install", req.body ?? {})).data)),
 		),
 		host.route(
 			"POST",
 			"/rollback",
-			safe(async (req, res) => json(res, await service.rollback(req.body ?? {}))),
+			safe(async (req, res) => json(res, (await handle("skill-import:rollback", req.body ?? {})).data)),
 		),
 		host.route(
 			"GET",
@@ -238,7 +307,7 @@ async function activate(host) {
 		host.route(
 			"POST",
 			"/update",
-			safe(async (req, res) => json(res, await service.update(req.body ?? {}))),
+			safe(async (req, res) => json(res, (await handle("skill-import:update", req.body ?? {})).data)),
 		),
 		host.route(
 			"GET",
@@ -248,12 +317,12 @@ async function activate(host) {
 		host.route(
 			"POST",
 			"/set-enabled",
-			safe(async (req, res) => json(res, await service.setEnabled(req.body ?? {}))),
+			safe(async (req, res) => json(res, (await handle("skill-import:set-enabled", req.body ?? {})).data)),
 		),
 		host.route(
 			"POST",
 			"/remove",
-			safe(async (req, res) => json(res, await service.removeSkill(req.body ?? {}))),
+			safe(async (req, res) => json(res, (await handle("skill-import:remove", req.body ?? {})).data)),
 		),
 		host.route(
 			"GET",
@@ -281,6 +350,16 @@ async function activate(host) {
 		),
 		host.route(
 			"GET",
+			"/reload",
+			safe(async (_req, res) => json(res, { ok: true, ...recommendService.pending() })),
+		),
+		host.route(
+			"POST",
+			"/ack-reload",
+			safe(async (_req, res) => json(res, recommendService.ackReload())),
+		),
+		host.route(
+			"GET",
 			"/discover-sources",
 			safe(async (_req, res) => json(res, await recommendService.discover())),
 		),
@@ -301,7 +380,13 @@ async function activate(host) {
 			"/download",
 			safe(async (req, res) => {
 				const q = req.query ?? {};
-				const out = await service.readSkill({ name: q.name, scopeId: q.scopeId });
+				const saved = q.context ? downloadContexts.get(String(q.context)) : null;
+				if (q.context && (!saved || saved.expires <= Date.now())) {
+					json(res, { ok: false, error: "下载上下文已过期，请刷新技能面板后重试" }, 410);
+					return;
+				}
+				const read = () => service.readSkill({ name: q.name, scopeId: q.scopeId });
+				const out = saved ? await requestContext.withContext(saved.context, read) : await read();
 				if (!out.ok) {
 					json(res, out, 404);
 					return;
@@ -320,18 +405,16 @@ async function activate(host) {
 	];
 
 	// 切换项目后落点跟着变
-	const offCwd = host.onCwdChange(async () => {
-		try {
-			host.broadcast({ type: "probe", data: await probe(host) });
-		} catch (err) {
-			host.log("error", "cwd 变更后探测失败", errText(err));
-		}
-	});
+	const contextChanged = () => host.broadcast({ type: "context-changed" });
+	const offCwd = host.onCwdChange(contextChanged);
+	const offConversation = host.onConversationChanged?.(contextChanged);
 
 	return () => {
 		offAgent();
 		offMessage();
 		offCwd();
+		offConversation?.();
+		downloadContexts.clear();
 		for (const off of offRoutes) {
 			try {
 				off();

@@ -57,8 +57,57 @@ function sourceFromMeta(meta) {
 function createImportService({ host, http, ops, getScopes }) {
 	/** @type {Map<string, {full:Map<string,Buffer>, label:string, meta:object, at:number, skipped:string[]}>} */
 	const cache = new Map();
-	/** 同一次检查里同一仓库只下一次 zipball。 */
-	let repoCache = new Map();
+	/** 仓库级缓存：同一个 repos@ref 的整仓包复用，避免每装一个技能重下 20s+。 */
+	const repoCache = new Map();
+	const REPO_CACHE_TTL_MS = 10 * 60 * 1000;
+	const REPO_CACHE_MAX_BYTES = 96 * 1024 * 1024;
+
+	function repoCacheKey(src) {
+		if (src?.kind !== "github") return "";
+		return `gh:${String(src.owner).toLowerCase()}/${String(src.repo).toLowerCase()}@${src.ref ?? ""}`;
+	}
+
+	function pruneRepoCache() {
+		const now = Date.now();
+		let total = 0;
+		for (const [key, value] of [...repoCache.entries()].sort((a, b) => b[1].at - a[1].at)) {
+			total += value.bytes ?? 0;
+			if (now - value.at > REPO_CACHE_TTL_MS || total > REPO_CACHE_MAX_BYTES) repoCache.delete(key);
+		}
+	}
+
+	/**
+	 * 拉取来源并保留仓库级缓存。
+	 * 关键：把目标 path 传给下载层，大仓库才能走「只拉子目录」通道，而不是整包下载后超限。
+	 */
+	async function resolveRepo(src, wantedPath = "") {
+		const key = repoCacheKey(src);
+		const hit = key ? repoCache.get(key) : null;
+		if (hit && Date.now() - hit.at < REPO_CACHE_TTL_MS) {
+			const narrowed = narrowToSkill(hit.files, wantedPath);
+			if (narrowed.ok) {
+				return { ...narrowed, full: hit.files, label: hit.label, meta: hit.meta, skipped: [], cached: true };
+			}
+		} else if (hit) {
+			repoCache.delete(key);
+		}
+
+		const resolved = await resolvePack({
+			src: { ...src, path: wantedPath },
+			http,
+			fs: host.fs,
+			requestAccess: (dir, reason) => host.fs.requestAccess(dir, reason),
+		});
+		// 只缓存整仓 zip：子树结果不是整仓，缓存了反而会让后续安装选错范围
+		if (resolved.ok && key && resolved.meta?.zip && resolved.full) {
+			const bytes = [...resolved.full.values()].reduce((n, buf) => n + buf.length, 0);
+			if (bytes <= REPO_CACHE_MAX_BYTES) {
+				repoCache.set(key, { at: Date.now(), files: resolved.full, label: resolved.label, meta: resolved.meta, bytes });
+				pruneRepoCache();
+			}
+		}
+		return resolved;
+	}
 
 	function pruneCache() {
 		const now = Date.now();
@@ -90,7 +139,7 @@ function createImportService({ host, http, ops, getScopes }) {
 	}
 
 	function pickScope(scopes, scopeId) {
-		return scopes.find((s) => s.id === scopeId) ?? scopes.find((s) => s.writable) ?? null;
+		return scopeId ? scopes.find((s) => s.id === scopeId) ?? null : scopes.find((s) => s.writable) ?? null;
 	}
 
 	async function readMetaAt(dir) {
@@ -146,19 +195,9 @@ function createImportService({ host, http, ops, getScopes }) {
 	}
 
 	async function fetchFull(src) {
-		const key =
-			src.kind === "github" ? `gh:${src.owner}/${src.repo}@${src.ref}` : `u:${src.url ?? src.path ?? ""}`;
-		if (repoCache.has(key)) return repoCache.get(key);
-		const res = await resolvePack({
-			src: { ...src, path: "" },
-			http,
-			fs: host.fs,
-			requestAccess: (dir, reason) => host.fs.requestAccess(dir, reason),
-		});
-		if (!res.ok) throw new Error(res.error);
-		const full = res.full ?? res.files;
-		repoCache.set(key, full);
-		return full;
+		const resolved = await resolveRepo(src, "");
+		if (!resolved.ok) throw new Error(resolved.error);
+		return resolved.full ?? resolved.files;
 	}
 
 	/** 预览：source 或 token（+path）→ 校验结果、候选、冲突、与已装版本的 diff。 */
@@ -170,12 +209,7 @@ function createImportService({ host, http, ops, getScopes }) {
 		if (!entry) {
 			const src = parseSource(source);
 			if (!src.ok) return { ok: false, error: src.error, hint: src.hint };
-			const resolved = await resolvePack({
-				src,
-				http,
-				fs: host.fs,
-				requestAccess: (dir, reason) => host.fs.requestAccess(dir, reason),
-			});
+			const resolved = await resolveRepo(src, String(path ?? src.path ?? ""));
 			if (!resolved.ok) return { ok: false, error: resolved.error, code: resolved.code };
 			const id = randomUUID();
 			entry = {
@@ -322,6 +356,7 @@ function createImportService({ host, http, ops, getScopes }) {
 		return {
 			ok: true,
 			name,
+			scopeId: scope.id,
 			target,
 			backup: result.backup,
 			files: result.files,
@@ -363,12 +398,15 @@ function createImportService({ host, http, ops, getScopes }) {
 		const record = list.find((r) => r.id === id);
 		if (!record) return { ok: false, error: "找不到这条安装记录" };
 		if (!record.backup) return { ok: false, error: "这次安装没有备份（首次安装无法回滚）" };
+		if (!(await getScopes()).some((scope) => scope.path === record.scopePath && scope.writable)) {
+			return { ok: false, error: "这条安装记录不属于当前项目的可写落点" };
+		}
 		if (!(await ops.exists(record.backup))) return { ok: false, error: `备份已被清理：${record.backup}` };
 
 		const res = await rollbackInstall({ target: record.target, backup: record.backup, ops });
 		if (!res.ok) return { ok: false, error: res.error };
 		writeRegistry(list.filter((r) => r.id !== id));
-		return { ok: true, name: record.name, target: record.target, needsReload: true };
+		return { ok: true, name: record.name, scopeId: record.scopeId, target: record.target, needsReload: true };
 	}
 
 	/** 每个技能只留最近 2 份备份，其余删掉。 */
@@ -391,7 +429,7 @@ function createImportService({ host, http, ops, getScopes }) {
 		const cleanName = String(name ?? "").trim();
 		if (!cleanName) return { ok: false, error: "缺少技能名" };
 		const scopes = await getScopes();
-		const scope = scopes.find((s) => s.id === scopeId) ?? scopes.find((s) => s.writable);
+		const scope = pickScope(scopes, scopeId);
 		if (!scope) return { ok: false, error: "找不到技能落点" };
 		if (!scope.writable) return { ok: false, error: `${scope.label} 不可写` };
 		const wantEnabled = Boolean(enabled);
@@ -436,7 +474,7 @@ function createImportService({ host, http, ops, getScopes }) {
 		const cleanName = String(name ?? "").trim();
 		if (!cleanName) return { ok: false, error: "缺少技能名" };
 		const scopes = await getScopes();
-		const scope = scopes.find((s) => s.id === scopeId) ?? scopes.find((s) => s.writable);
+		const scope = pickScope(scopes, scopeId);
 		if (!scope) return { ok: false, error: "找不到技能落点" };
 		if (!scope.writable) return { ok: false, error: `${scope.label} 不可写` };
 		const found = await locateSkill(scope, cleanName);
@@ -446,7 +484,7 @@ function createImportService({ host, http, ops, getScopes }) {
 		} catch (err) {
 			return { ok: false, error: err instanceof Error ? err.message : String(err) };
 		}
-		writeRegistry(readRegistry().filter((r) => r.target !== found.path && r.name !== cleanName));
+		writeRegistry(readRegistry().filter((r) => !(r.scopePath === scope.path && r.name === cleanName)));
 		return { ok: true, name: cleanName, scopeId: scope.id, wasEnabled: found.enabled, needsReload: true };
 	}
 
@@ -455,7 +493,7 @@ function createImportService({ host, http, ops, getScopes }) {
 		const cleanName = String(name ?? "").trim();
 		if (!cleanName) return { ok: false, error: "缺少技能名" };
 		const scopes = await getScopes();
-		const scope = scopes.find((s) => s.id === scopeId) ?? scopes.find((s) => s.writable);
+		const scope = pickScope(scopes, scopeId);
 		if (!scope) return { ok: false, error: "找不到技能落点" };
 		const found = await locateSkill(scope, cleanName);
 		if (!found) return { ok: false, error: `找不到技能「${cleanName}」` };
@@ -525,7 +563,7 @@ function createImportService({ host, http, ops, getScopes }) {
 	 * 同一仓库只下载一次；最多检查 MAX_CHECK 个。
 	 */
 	async function checkUpdates() {
-		repoCache = new Map();
+		repoCache.clear();
 		const scopes = await getScopes();
 		const items = [];
 		for (const scope of scopes) {

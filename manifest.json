@@ -1,7 +1,7 @@
 {
 	"id": "skill-import",
 	"name": "技能导入",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "快捷导入 Agent Skills：整目录安装到全局或项目，落盘前校验、冲突检测、可回滚。",
 	"apiVersion": 2,
 	"permissions": [
@@ -47,7 +47,7 @@
 			"type": "text",
 			"label": "索引仓库（逗号分隔，可带 #分支）",
 			"default": "anthropics/skills, feifeifei527/pi-skills-hub, addyosmani/agent-skills, obra/superpowers, peterfei/ai-agent-team, badlogic/pi-skills, ComposioHQ/awesome-claude-skills",
-			"hint": "推荐候选来自这些仓库；改完点「重建索引」"
+			"hint": "推荐候选来自这些仓库；改完到「高级 → 更新技能库」重建"
 		},
 		{
 			"key": "topN",

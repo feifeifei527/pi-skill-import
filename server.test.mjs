@@ -597,3 +597,79 @@ describe("zip 打包（下载用）", () => {
 		assert.deepEqual([...back.files.get("assets/blob.bin")], [0, 1, 2, 3, 0, 255]);
 	});
 });
+
+// ---------- 推荐安装：大仓库走子树、同仓复用整仓包 ----------
+
+/** 只读网络桩：HEAD 报体积、tree 列表、raw 文件、codeload 计数。 */
+function installHttp({ zipBytes = 0, zipBuffer = null, files = ["skills/demo/SKILL.md"] } = {}) {
+	const calls = [];
+	return {
+		calls,
+		head: async (url) => {
+			calls.push(["HEAD", url]);
+			return { ok: true, status: 200, contentLength: zipBytes };
+		},
+		get: async (url) => {
+			calls.push(["GET", url]);
+			if (url.includes("api.github.com")) {
+				return { ok: true, buffer: Buffer.from(JSON.stringify({ tree: files.map((path) => ({ type: "blob", path, size: 10 })) })) };
+			}
+			if (url.includes("raw.githubusercontent.com")) {
+				return url.endsWith("/SKILL.md") ? { ok: true, buffer: Buffer.from(SKILL_MD) } : { ok: false, error: "HTTP 404" };
+			}
+			if (url.includes("codeload")) {
+				return zipBuffer ? { ok: true, buffer: zipBuffer } : { ok: false, error: "HTTP 404" };
+			}
+			return { ok: false, error: `unexpected ${url}` };
+		},
+	};
+}
+
+async function setupWithHttp(http) {
+	const root = await mkdtemp(join(tmpdir(), "si-service-http-"));
+	const skillsDir = join(root, ".pi", "skills");
+	const globalDir = join(root, "global-skills");
+	const host = createFakeHost(root);
+	const service = createImportService({
+		host,
+		http,
+		ops: createOps(host),
+		getScopes: () => makeScopes(host, skillsDir, globalDir),
+	});
+	return { root, skillsDir, service };
+}
+
+describe("推荐安装的网络路径", () => {
+	it("带 path 预览超大仓库：只拉子目录，不下载整包", async () => {
+		const http = installHttp({ zipBytes: 300 * 1024 * 1024 });
+		const { root, service } = await setupWithHttp(http);
+		try {
+			const p = await service.preview({ source: "o/r", path: "skills/demo" });
+			assert.equal(p.ok, true, p.error);
+			assert.equal(p.inspection.skill.name, "pdf-tools");
+			assert.ok(!http.calls.some(([method, url]) => method === "GET" && url.includes("codeload")), "不该整包下载");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("同一仓库连续装两个技能：整仓包复用，只下载一次", async () => {
+		const zip = buildZip([
+			{ name: "repo-main/skills/demo/SKILL.md", data: SKILL_MD },
+			{ name: "repo-main/skills/other/SKILL.md", data: "---\nname: other\ndescription: 另一个技能，当需要别的能力时使用。\n---\n" },
+		]);
+		const http = installHttp({ zipBytes: 1024, zipBuffer: zip });
+		const { root, service } = await setupWithHttp(http);
+		try {
+			const first = await service.preview({ source: "o/r", path: "skills/demo" });
+			assert.equal(first.ok, true, first.error);
+			const second = await service.preview({ source: "o/r", path: "skills/other" });
+			assert.equal(second.ok, true, second.error);
+			assert.equal(second.inspection.skill.dirName, "other");
+			const downloads = http.calls.filter(([method, url]) => method === "GET" && url.includes("codeload"));
+			assert.equal(downloads.length, 1, "第二个技能应复用已下载的整仓包");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+});

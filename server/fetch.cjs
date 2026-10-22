@@ -4,7 +4,7 @@
  */
 const { rawCandidates } = require("../core/source.cjs");
 const { readZip, stripCommonRoot } = require("../core/zip.cjs");
-const { fetchSubtree } = require("./repo-tree.cjs");
+const { fetchSubtree, fetchRepoMeta } = require("./repo-tree.cjs");
 const { baseName, dirnamePosix, joinPosix } = require("../core/util.cjs");
 
 const DEFAULT_LIMITS = {
@@ -125,7 +125,23 @@ async function resolvePack({ src, http, fs, requestAccess, limits = {} }) {
 		case "github": {
 			const errors = [];
 			let tooBig = false;
-			for (const url of zipCandidates(src)) {
+			// codeload 的 HEAD 经常不给 content-length：体积未知且本次只要某个子目录时，
+			// 先问一次仓库大小，避免白下几十 MB 再超时。
+			if (src.path && typeof http.head === "function") {
+				const head = await http.head(zipCandidates(src)[0], { timeoutMs: 10_000 });
+				if (head.ok && head.contentLength > lim.zipBytes) {
+					tooBig = true;
+					errors.push(`包太大（${(head.contentLength / 1048576).toFixed(0)}MB > ${(lim.zipBytes / 1048576).toFixed(0)}MB）`);
+				} else if (!head.contentLength) {
+					const meta = await fetchRepoMeta({ owner: src.owner, repo: src.repo, http });
+					const bytes = (Number(meta.size) || 0) * 1024;
+					if (bytes > lim.zipBytes) {
+						tooBig = true;
+						errors.push(`包太大（仓库按 ${(bytes / 1048576).toFixed(0)}MB 估算 > ${(lim.zipBytes / 1048576).toFixed(0)}MB）`);
+					}
+				}
+			}
+			if (!tooBig) for (const url of zipCandidates(src)) {
 				// 先 HEAD 探大小：大仓库直接走 tree API 子目录通道，不浪费流量
 				const head = typeof http.head === "function" ? await http.head(url, { timeoutMs: 15_000 }) : { ok: true, contentLength: 0 };
 				if (head.ok && head.contentLength > lim.zipBytes) {
@@ -138,6 +154,11 @@ async function resolvePack({ src, http, fs, requestAccess, limits = {} }) {
 				if (!res.ok) {
 					errors.push(res.error);
 					if (/超过上限/.test(res.error)) {
+						tooBig = true;
+						break;
+					}
+					// 已知子目录时，超时/断流也改走子树：只要几秒，比整包重试划算
+					if (src.path && /abort|timeout|timed out|ECONNRESET|socket hang up/i.test(res.error)) {
 						tooBig = true;
 						break;
 					}
