@@ -1,0 +1,47 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node:
+    name: node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # pi-web-ui 要求 Node >= 22.19；24 是当前开发版本
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: syntax check
+        run: |
+          set -e
+          for f in $(git ls-files '*.mjs' '*.cjs'); do
+            node --check "$f"
+          done
+
+      - name: unit tests
+        run: |
+          node --test \
+            core.test.mjs \
+            server.test.mjs \
+            recommend.test.mjs \
+            repo-tree.test.mjs \
+            pipeline.test.mjs \
+            index.test.mjs

@@ -1,5 +1,7 @@
 # skill-import
 
+[![test](https://github.com/feifeifei527/pi-skill-import/actions/workflows/test.yml/badge.svg)](https://github.com/feifeifei527/pi-skill-import/actions/workflows/test.yml)
+
 pi-web-ui 界面插件：快捷导入、管理、推荐 Agent Skills。
 
 - 右侧「技能」tab：全局/项目技能列表、启停、下载、删除
