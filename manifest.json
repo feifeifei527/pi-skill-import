@@ -1,0 +1,72 @@
+{
+	"id": "skill-import",
+	"name": "技能导入",
+	"version": "0.1.0",
+	"description": "快捷导入 Agent Skills：整目录安装到全局或项目，落盘前校验、冲突检测、可回滚。",
+	"apiVersion": 2,
+	"permissions": [
+		"ui",
+		"fs",
+		"http",
+		"net",
+		"tools",
+		"llm"
+	],
+	"netAllowlist": [
+		"codeload.github.com",
+		"github.com",
+		"api.github.com",
+		"raw.githubusercontent.com",
+		"objects.githubusercontent.com"
+	],
+	"ui": {
+		"settings.pages": [
+			{
+				"id": "import",
+				"label": "技能导入",
+				"icon": "📥",
+				"kind": "page",
+				"order": 60,
+				"hint": "粘贴链接 / 本地目录 / zip，整目录装进 skills"
+			}
+		],
+		"rightpanel.tabs": [
+			{
+				"id": "skills",
+				"label": "技能",
+				"icon": "📦",
+				"kind": "view",
+				"order": 20,
+				"hint": "全局/项目技能：启停、下载、删除"
+			}
+		]
+	},
+	"settings": [
+		{
+			"key": "repos",
+			"type": "text",
+			"label": "索引仓库（逗号分隔，可带 #分支）",
+			"default": "anthropics/skills, feifeifei527/pi-skills-hub, addyosmani/agent-skills, obra/superpowers, peterfei/ai-agent-team, badlogic/pi-skills, ComposioHQ/awesome-claude-skills",
+			"hint": "推荐候选来自这些仓库；改完点「重建索引」"
+		},
+		{
+			"key": "topN",
+			"type": "number",
+			"label": "推荐条数（精排后最多几条）",
+			"default": 3,
+			"min": 1,
+			"max": 8
+		},
+		{
+			"key": "rerank",
+			"type": "boolean",
+			"label": "用模型精排（任务理解 → 检索 → 判断值不值得装）",
+			"default": true
+		},
+		{
+			"key": "githubToken",
+			"type": "secret",
+			"label": "GitHub Token（可选：API 限额 60/h → 5000/h，只发给 api.github.com）"
+		}
+	]
+}
